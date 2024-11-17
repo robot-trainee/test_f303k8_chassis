@@ -23,6 +23,8 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -45,10 +47,14 @@ CAN_HandleTypeDef hcan;
 TIM_HandleTypeDef htim1;
 TIM_HandleTypeDef htim2;
 TIM_HandleTypeDef htim3;
+TIM_HandleTypeDef htim15;
 
 UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
+uint16_t motor_count = 0;
+uint16_t encoder_count = 0;
+float cmd_vel[2]; // right_back, left_back
 
 /* USER CODE END PV */
 
@@ -60,6 +66,7 @@ static void MX_CAN_Init(void);
 static void MX_TIM1_Init(void);
 static void MX_TIM2_Init(void);
 static void MX_TIM3_Init(void);
+static void MX_TIM15_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -72,12 +79,79 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
   uint8_t RxData[8];
   if (HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &RxHeader, RxData) == HAL_OK)
   {
-    if (RxData[0] == 0)
-    {
-      HAL_GPIO_TogglePin(LD3_GPIO_Port, LD3_Pin);
-    }
     printf("id=%#x, [0]=%#x, [1]=%#x, [2]=%#x, [3]=%#x, [4]=%#x, [5]=%#x, [6]=%#x, [7]=%#x\r\n",
       RxHeader.StdId, RxData[0], RxData[1], RxData[2], RxData[3], RxData[4], RxData[5], RxData[6], RxData[7]);
+
+    if (RxHeader.StdId == 0x711)
+    {
+      HAL_GPIO_TogglePin(LD3_GPIO_Port, LD3_Pin);
+      union {
+          float f;
+          int32_t ui;
+      } data;
+      data.ui = (int32_t) (
+            (((int32_t)RxData[0] << 24) & 0xFF000000)
+          | (((int32_t)RxData[1] << 16) & 0x00FF0000)
+          | (((int32_t)RxData[2] <<  8) & 0x0000FF00)
+          | (((int32_t)RxData[3] <<  0) & 0x000000FF)
+      );
+      cmd_vel[0] = data.f;
+      data.ui = (int32_t) (
+            (((int32_t)RxData[4] << 24) & 0xFF000000)
+          | (((int32_t)RxData[5] << 16) & 0x00FF0000)
+          | (((int32_t)RxData[6] <<  8) & 0x0000FF00)
+          | (((int32_t)RxData[7] <<  0) & 0x000000FF)
+      );
+      cmd_vel[1] = data.f;
+
+      printf("cmd_vel: [0]=%f, [1]=%f\r\n", cmd_vel[0], cmd_vel[1]);
+    }
+  }
+}
+
+int16_t read_encoder_value()
+{
+  uint16_t enc_buff = TIM2->CNT;
+  int16_t enc_count = (int16_t)enc_buff - 32767;
+  TIM2->CNT = 32767;
+  return enc_count;
+}
+
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+  if (htim == &htim15)
+  {
+    // ---encoder
+    encoder_count++;
+    if (encoder_count > 200) // 5Hz
+    {
+      encoder_count = 0;
+      int16_t encoder_value = read_encoder_value();
+      // printf("enc_buff: %d\r\n", encoder_value);
+      // printf("out(deg/s): %f\r\n", (float)encoder_value * 1.20321);
+    }
+
+    // ---motor
+    motor_count++;
+    if (motor_count > 50) // 20Hz
+    {
+      float output_raw = cmd_vel[0] * 50.0;
+      int16_t output = (int)output_raw;
+      if (output > 0)
+      {
+        HAL_GPIO_WritePin(RIGHT_MOTOR_PAHSE_GPIO_Port, RIGHT_MOTOR_PAHSE_Pin, GPIO_PIN_SET);
+      }
+      else
+      {
+        output *= -1;
+        HAL_GPIO_WritePin(RIGHT_MOTOR_PAHSE_GPIO_Port, RIGHT_MOTOR_PAHSE_Pin, GPIO_PIN_RESET);
+      }
+      __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, output);
+      HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
+
+      motor_count = 0;
+      printf("output: %d\r\n", output);
+    }
   }
 }
 
@@ -116,7 +190,11 @@ int main(void)
   MX_TIM1_Init();
   MX_TIM2_Init();
   MX_TIM3_Init();
+  MX_TIM15_Init();
   /* USER CODE BEGIN 2 */
+  HAL_TIM_Base_Start_IT(&htim15);
+  HAL_TIM_Encoder_Start(&htim2, TIM_CHANNEL_ALL);
+  HAL_TIM_Encoder_Start(&htim3, TIM_CHANNEL_ALL);
   HAL_CAN_Start(&hcan);
   if (HAL_CAN_ActivateNotification(&hcan, CAN_IT_RX_FIFO0_MSG_PENDING) != HAL_OK)
   {
@@ -132,8 +210,9 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    printf("Hello!!\r\n");
-    HAL_Delay(5000);
+    // printf("Hello!!\r\n");
+    HAL_GPIO_TogglePin(LD3_GPIO_Port, LD3_Pin);
+    HAL_Delay(50);
   }
   /* USER CODE END 3 */
 }
@@ -414,6 +493,52 @@ static void MX_TIM3_Init(void)
   /* USER CODE BEGIN TIM3_Init 2 */
 
   /* USER CODE END TIM3_Init 2 */
+
+}
+
+/**
+  * @brief TIM15 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM15_Init(void)
+{
+
+  /* USER CODE BEGIN TIM15_Init 0 */
+
+  /* USER CODE END TIM15_Init 0 */
+
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  /* USER CODE BEGIN TIM15_Init 1 */
+
+  /* USER CODE END TIM15_Init 1 */
+  htim15.Instance = TIM15;
+  htim15.Init.Prescaler = 8-1;
+  htim15.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim15.Init.Period = 1000-1;
+  htim15.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim15.Init.RepetitionCounter = 0;
+  htim15.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim15) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim15, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim15, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM15_Init 2 */
+
+  /* USER CODE END TIM15_Init 2 */
 
 }
 
